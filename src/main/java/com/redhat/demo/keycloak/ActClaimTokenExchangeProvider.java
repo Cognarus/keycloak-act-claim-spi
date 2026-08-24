@@ -1,7 +1,15 @@
 package com.redhat.demo.keycloak;
 
+import java.io.IOException;
+import java.security.PublicKey;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
@@ -12,18 +20,67 @@ import org.keycloak.OAuth2Constants;
 import org.keycloak.OAuthErrorException;
 import org.keycloak.TokenVerifier;
 import org.keycloak.common.VerificationException;
+import org.keycloak.connections.httpclient.HttpClientProvider;
+import org.keycloak.crypto.KeyUse;
+import org.keycloak.crypto.KeyWrapper;
+import org.keycloak.crypto.SignatureProvider;
+import org.keycloak.crypto.SignatureVerifierContext;
+import org.keycloak.jose.jwk.JSONWebKeySet;
+import org.keycloak.jose.jwk.JWK;
+import org.keycloak.jose.jwk.JWKParser;
+import org.keycloak.jose.jws.JWSHeader;
 import org.keycloak.models.KeycloakSession;
+import org.keycloak.models.RealmModel;
 import org.keycloak.protocol.oidc.TokenExchangeContext;
 import org.keycloak.protocol.oidc.TokenExchangeProvider;
 import org.keycloak.protocol.oidc.tokenexchange.StandardTokenExchangeProvider;
+import org.keycloak.protocol.oidc.utils.JWKSHttpUtils;
 import org.keycloak.representations.AccessToken;
 import org.keycloak.representations.AccessTokenResponse;
 import org.keycloak.services.ErrorResponseException;
 
+/**
+ * RFC 8693 OBO token-exchange provider that injects the {@code act} claim.
+ *
+ * <p>Closes COG-879 (keycloak act-claim SPI emits {@code act} from an
+ * actor_token it never cryptographically verifies). Constraints 1–4 of the
+ * COG-879 threat-model document apply here:
+ *
+ * <ol>
+ *   <li>Trust anchor, not a string match — and call {@code .verify()}. The
+ *       actor_token is either (a) Keycloak-issued, verified against this
+ *       realm's signing keys, or (b) signed by a key whose {@code iss} is on
+ *       a configured trust list AND whose JWKS is fetched from that issuer
+ *       and contains a key matching the actor_token's {@code kid}. An
+ *       unsigned / {@code alg:none} token is rejected.</li>
+ *   <li>Fail closed — the whole exchange is rejected (4xx) on any
+ *       verification failure. We do not silently drop {@code act}.</li>
+ *   <li>Deny-by-default config — the trust list is per-realm configuration
+ *       (attribute {@value #TRUSTED_ISSUERS_ATTR}). Empty / unset ⇒ deny.</li>
+ *   <li>Validate more than {@code iss} — the actor_token is also checked for
+ *       expiry ({@link TokenVerifier#IS_ACTIVE}).</li>
+ * </ol>
+ */
 public class ActClaimTokenExchangeProvider implements TokenExchangeProvider {
 
     private static final Logger LOG = Logger.getLogger(ActClaimTokenExchangeProvider.class);
     private static final int MAX_ACT_DEPTH = 10;
+
+    /**
+     * Per-realm attribute holding the comma-separated list of trusted actor_token
+     * issuer URLs. Empty / unset ⇒ deny (constraint 3). See
+     * {@link #parseTrustedIssuers(String)} for the entry format.
+     */
+    public static final String TRUSTED_ISSUERS_ATTR = "act-claim-trusted-issuers";
+
+    /**
+     * Realm attribute that holds the configured issuer URL. Keycloak stores the
+     * issuer under the standard {@code "issuer"} attribute (see
+     * {@code org.keycloak.models.RealmAttributes.ISSUER}).
+     */
+    private static final String REALM_ISSUER_ATTR = "issuer";
+
+    private static final ObjectMapper JSON = new ObjectMapper();
 
     private final KeycloakSession session;
     private final StandardTokenExchangeProvider delegate;
@@ -39,11 +96,6 @@ public class ActClaimTokenExchangeProvider implements TokenExchangeProvider {
     }
 
     @Override
-    public int getVersion() {
-        return 1;
-    }
-
-    @Override
     public Response exchange(TokenExchangeContext context) {
         LOG.debug("Entering act-claim token exchange");
 
@@ -56,17 +108,12 @@ public class ActClaimTokenExchangeProvider implements TokenExchangeProvider {
         }
 
         try {
-            TokenVerifier<AccessToken> verifier = TokenVerifier.create(actorTokenString, AccessToken.class);
-            verifier.withChecks(TokenVerifier.IS_ACTIVE);
-            AccessToken actorToken = verifier.getToken();
+            AccessToken actorToken = verifyActorToken(actorTokenString, context);
 
             String actorSub = actorToken.getSubject();
-            String actorClientId = actorToken.getIssuedFor(); // azp = SPIFFE ID
-            LOG.debugv("Actor token sub: {0}, client_id: {1}", actorSub, actorClientId);
+            String actorClientId = actorToken.getIssuedFor();
+            LOG.debugv("Verified actor token sub: {0}, client_id: {1}", actorSub, actorClientId);
 
-            // Read the existing act chain from the SUBJECT token (the token
-            // being exchanged), not the actor token. The subject token carries
-            // the delegation chain from previous hops.
             String subjectTokenString = context.getFormParams().getFirst(OAuth2Constants.SUBJECT_TOKEN);
             Map<String, Object> existingAct = null;
             if (subjectTokenString != null) {
@@ -117,14 +164,22 @@ public class ActClaimTokenExchangeProvider implements TokenExchangeProvider {
 
             return response;
 
+        } catch (UntrustedActorTokenException e) {
+            // Constraint 2: fail closed. The actor_token is untrusted — reject
+            // the whole exchange. The exchange MUST NOT silently drop `act`.
+            LOG.errorv("Untrusted actor_token rejected: {0}", e.getMessage());
+            throw new ErrorResponseException(
+                    OAuthErrorException.INVALID_REQUEST,
+                    "actor_token rejected: " + e.getMessage(),
+                    Response.Status.BAD_REQUEST);
+        } catch (ErrorResponseException e) {
+            throw e;
         } catch (VerificationException e) {
             LOG.error("Actor token verification failed", e);
             throw new ErrorResponseException(
                     OAuthErrorException.INVALID_TOKEN,
-                    "Invalid actor token: " + e.getMessage(),
+                    "Invalid actor_token: " + e.getMessage(),
                     Response.Status.BAD_REQUEST);
-        } catch (ErrorResponseException e) {
-            throw e;
         } catch (Exception e) {
             LOG.error("Unexpected error during act-claim token exchange", e);
             throw new ErrorResponseException(
@@ -132,6 +187,263 @@ public class ActClaimTokenExchangeProvider implements TokenExchangeProvider {
                     "Token exchange failed: " + e.getMessage(),
                     Response.Status.INTERNAL_SERVER_ERROR);
         }
+    }
+
+    /**
+     * Verify the actor_token's signature against the appropriate trust anchor
+     * (local realm keys or a trusted-issuer JWKS) AND its expiry. The
+     * {@link TokenVerifier#IS_ACTIVE} check covers {@code exp} / {@code nbf}.
+     *
+     * <p>Constraint 1: trust anchor, not a string match. Constraint 2: on any
+     * verification failure this method throws (no silent drop). Constraint 3:
+     * an external issuer must appear in the configured trust list, otherwise
+     * it is denied.
+     *
+     * @return the verified {@link AccessToken}
+     * @throws VerificationException on any signature / claim / format failure
+     * @throws UntrustedActorTokenException on issuer-trust failure (constraint 3)
+     */
+    private AccessToken verifyActorToken(String actorTokenString, TokenExchangeContext context)
+            throws VerificationException {
+        // Parse-only pass so we can read iss/kid/alg before deciding which key
+        // to verify against. We add IS_ACTIVE here so expiry/format errors are
+        // raised before we do the (possibly expensive) JWKS fetch.
+        TokenVerifier<AccessToken> parsed = TokenVerifier.create(actorTokenString, AccessToken.class)
+                .withChecks(TokenVerifier.IS_ACTIVE)
+                .parse();
+        AccessToken actorToken = parsed.getToken();
+        JWSHeader header = parsed.getHeader();
+
+        String kid = header != null ? header.getKeyId() : null;
+        String alg = header != null ? header.getRawAlgorithm() : null;
+        String iss = actorToken.getIssuer();
+        if ("none".equalsIgnoreCase(alg)) {
+            // Constraint 1, hypothesis (test): an unsigned / alg:none
+            // actor_token MUST be rejected. The whole point of closing the
+            // root-cause defect ("never calls .verify()") is to ensure no
+            // attacker-controlled unsigned token can ride through.
+            throw new UntrustedActorTokenException("unsigned actor_token (alg=none) is not allowed");
+        }
+
+        RealmModel realm = context.getRealm();
+        KeycloakSession session = context.getSession();
+        String localIssuer = resolveLocalIssuer(realm, session);
+
+        SignatureVerifierContext verifierCtx;
+        if (iss != null && normalizeIssuer(iss).equals(normalizeIssuer(localIssuer))) {
+            // Path A: Keycloak-issued — verify against this realm's signing keys.
+            LOG.debugv("Actor token issuer matches local realm issuer; verifying against realm keys");
+            verifierCtx = localVerifier(session, realm, kid, alg);
+        } else {
+            // Path B: external issuer — must be on the configured trust list,
+            // AND signature must verify against that issuer's JWKS.
+            String trustedIssuers = realm.getAttribute(TRUSTED_ISSUERS_ATTR);
+            List<String> trustedList = parseTrustedIssuers(trustedIssuers);
+            String normalizedIss = normalizeIssuer(iss);
+            if (trustedList.isEmpty()) {
+                throw new UntrustedActorTokenException(
+                        "actor_token issuer '" + iss + "' is not the local realm issuer and the " +
+                        "configured trust list ('" + TRUSTED_ISSUERS_ATTR + "') is empty — deny-by-default");
+            }
+            if (!trustedList.contains(normalizedIss)) {
+                throw new UntrustedActorTokenException(
+                        "actor_token issuer '" + iss + "' is not on the configured trust list " +
+                        "('" + TRUSTED_ISSUERS_ATTR + "')");
+            }
+            LOG.debugv("Actor token issuer matches trust list entry; verifying against issuer JWKS");
+            verifierCtx = externalVerifier(session, iss, kid, alg);
+        }
+
+        // Final verify pass with the resolved verifier context. This runs the
+        // signature check (constraint 1) and IS_ACTIVE (constraint 4).
+        return TokenVerifier.create(actorTokenString, AccessToken.class)
+                .verifierContext(verifierCtx)
+                .withChecks(TokenVerifier.IS_ACTIVE)
+                .verify()
+                .getToken();
+    }
+
+    /**
+     * Build a {@link SignatureVerifierContext} for an actor_token that was
+     * issued by this Keycloak realm.
+     */
+    private SignatureVerifierContext localVerifier(KeycloakSession session, RealmModel realm,
+                                                   String kid, String alg) throws VerificationException {
+        if (alg == null || alg.isEmpty()) {
+            throw new VerificationException("actor_token JWS header missing 'alg'");
+        }
+        KeyWrapper key;
+        if (kid != null && !kid.isEmpty()) {
+            key = session.keys().getKey(realm, kid, KeyUse.SIG, alg);
+        } else {
+            // No kid: pick the realm's active signing key for the alg.
+            key = session.keys().getActiveKey(realm, KeyUse.SIG, alg);
+        }
+        if (key == null || key.getPublicKey() == null) {
+            throw new VerificationException(
+                    "actor_token signing key not found in realm keys (kid=" + kid + ", alg=" + alg + ")");
+        }
+        SignatureProvider provider = session.getProvider(SignatureProvider.class, alg);
+        if (provider == null) {
+            throw new VerificationException("no SignatureProvider registered for alg=" + alg);
+        }
+        SignatureProvider.checkKeyForVerification(key, alg, "verification");
+        return provider.verifier(key);
+    }
+
+    /**
+     * Build a {@link SignatureVerifierContext} for an actor_token issued by
+     * an external (trusted) issuer. Fetches the issuer's JWKS via OIDC
+     * discovery (or Keycloak's default JWKS path), selects the key whose
+     * {@code kid} matches the actor_token header, and returns the verifier.
+     */
+    private SignatureVerifierContext externalVerifier(KeycloakSession session, String issuer,
+                                                      String kid, String alg) throws VerificationException {
+        if (kid == null || kid.isEmpty()) {
+            throw new VerificationException("actor_token JWS header missing 'kid' — cannot resolve external key");
+        }
+        if (alg == null || alg.isEmpty()) {
+            throw new VerificationException("actor_token JWS header missing 'alg' — cannot resolve external key");
+        }
+        String jwksUrl = resolveJwksUrl(session, issuer);
+        LOG.debugv("Fetching JWKS for trusted issuer {0} from {1}", issuer, jwksUrl);
+        JSONWebKeySet jwks;
+        try {
+            jwks = JWKSHttpUtils.sendJwksRequest(session, jwksUrl);
+        } catch (Exception e) {
+            throw new VerificationException(
+                    "Failed to fetch JWKS from " + jwksUrl + ": " + e.getMessage(), e);
+        }
+        if (jwks == null || jwks.getKeys() == null || jwks.getKeys().length == 0) {
+            throw new VerificationException("JWKS at " + jwksUrl + " contains no keys");
+        }
+        JWK matched = null;
+        for (JWK k : jwks.getKeys()) {
+            if (kid.equals(k.getKeyId())) {
+                matched = k;
+                break;
+            }
+        }
+        if (matched == null) {
+            // Hypothesis (test) on constraint 1: an actor_token signed by a key
+            // not in that issuer's JWKS MUST be rejected. This is exactly that
+            // branch: the kid is nowhere on the trust list's JWKS.
+            throw new UntrustedActorTokenException(
+                    "actor_token kid '" + kid + "' not present in trusted issuer " + issuer + " JWKS");
+        }
+
+        PublicKey publicKey;
+        try {
+            publicKey = JWKParser.create(matched).toPublicKey();
+        } catch (RuntimeException e) {
+            throw new VerificationException(
+                    "Cannot extract public key from JWK kid=" + kid + ": " + e.getMessage(), e);
+        }
+        if (publicKey == null) {
+            throw new VerificationException("Cannot extract public key from JWK kid=" + kid);
+        }
+
+        KeyWrapper kw = new KeyWrapper();
+        kw.setKid(kid);
+        kw.setAlgorithm(alg);
+        kw.setUse(KeyUse.SIG);
+        kw.setPublicKey(publicKey);
+
+        SignatureProvider provider = session.getProvider(SignatureProvider.class, alg);
+        if (provider == null) {
+            throw new VerificationException("no SignatureProvider registered for alg=" + alg);
+        }
+        SignatureProvider.checkKeyForVerification(kw, alg, "verification");
+        return provider.verifier(kw);
+    }
+
+    /**
+     * Resolve the JWKS URL for an external issuer. Tries OIDC discovery at
+     * {@code <issuer>/.well-known/openid-configuration} and reads the
+     * {@code jwks_uri} claim. Falls back to the Keycloak default JWKS path
+     * {@code <issuer>/protocol/openid-connect/certs} for compatibility with
+     * Keycloak-compatible identity brokers.
+     */
+    private String resolveJwksUrl(KeycloakSession session, String issuer) throws VerificationException {
+        String base = issuer.endsWith("/") ? issuer.substring(0, issuer.length() - 1) : issuer;
+        String discoveryUrl = base + "/.well-known/openid-configuration";
+        try {
+            HttpClientProvider http = session.getProvider(HttpClientProvider.class);
+            // Use getString(...) instead of the deprecated get(...) to read the
+            // discovery document — getString returns the response body as a
+            // String directly, which is what we need for JSON parsing.
+            String body = http.getString(discoveryUrl);
+            JsonNode node = JSON.readTree(body);
+            JsonNode jwksUri = node.get("jwks_uri");
+            if (jwksUri != null && jwksUri.isTextual()) {
+                return jwksUri.asText();
+            }
+        } catch (IOException | RuntimeException e) {
+            LOG.debugv("OIDC discovery at {0} failed: {1}, falling back to default JWKS path",
+                    discoveryUrl, e.getMessage());
+        }
+        return base + "/protocol/openid-connect/certs";
+    }
+
+    /**
+     * Resolve the issuer URL of this Keycloak realm — what {@code actor_token.iss}
+     * would be for a token we issued ourselves. Uses the configured issuer
+     * attribute when present; otherwise derives from the request base URI and
+     * realm name.
+     */
+    static String resolveLocalIssuer(RealmModel realm, KeycloakSession session) {
+        String attr = realm.getAttribute(REALM_ISSUER_ATTR);
+        if (attr != null && !attr.isBlank()) {
+            return attr;
+        }
+        java.net.URI base = session.getContext().getUri().getBaseUri();
+        String baseStr = base.toString();
+        if (baseStr.endsWith("/")) {
+            baseStr = baseStr.substring(0, baseStr.length() - 1);
+        }
+        return baseStr + "/realms/" + realm.getName();
+    }
+
+    /**
+     * Normalize an issuer URL for equality comparison: trim whitespace and
+     * strip trailing slashes. This is sufficient for the trust-list lookup
+     * (no scheme/host case folding, no query-param sorting) — strong
+     * normalization is the issuer's responsibility, not ours.
+     */
+    static String normalizeIssuer(String issuer) {
+        if (issuer == null) return "";
+        String s = issuer.trim();
+        while (s.endsWith("/")) {
+            s = s.substring(0, s.length() - 1);
+        }
+        return s;
+    }
+
+    /**
+     * Parse the realm attribute holding the trusted-issuers list. Format: a
+     * comma-separated list of issuer URLs (whitespace tolerated). Returns an
+     * empty list when the attribute is null or blank.
+     *
+     * <p>Constraint 3 (deny-by-default): an empty list makes every external
+     * actor_token untrusted — the caller must treat {@code isEmpty()} as a
+     * deny signal, not as "allow everything."
+     */
+    static List<String> parseTrustedIssuers(String trustedIssuers) {
+        if (trustedIssuers == null || trustedIssuers.isBlank()) {
+            return Collections.emptyList();
+        }
+        List<String> result = new ArrayList<>();
+        for (String entry : trustedIssuers.split(",")) {
+            String trimmed = entry.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            String normalized = normalizeIssuer(trimmed);
+            if (!result.contains(normalized)) {
+                result.add(normalized);
+            }
+        }
+        return result;
     }
 
     static Map<String, Object> buildActClaim(String actorSub, String actorClientId,
@@ -169,5 +481,17 @@ public class ActClaimTokenExchangeProvider implements TokenExchangeProvider {
     @Override
     public void close() {
         // no-op
+    }
+
+    /**
+     * Distinguished exception for issuer-trust failures. The exchange handler
+     * translates this into a 4xx {@link ErrorResponseException} so the caller
+     * sees a clear "untrusted actor" rejection rather than a generic
+     * verification error.
+     */
+    static class UntrustedActorTokenException extends RuntimeException {
+        UntrustedActorTokenException(String message) {
+            super(message);
+        }
     }
 }

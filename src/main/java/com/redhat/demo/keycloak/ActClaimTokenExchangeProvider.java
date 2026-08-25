@@ -251,7 +251,13 @@ public class ActClaimTokenExchangeProvider implements TokenExchangeProvider {
                         "('" + TRUSTED_ISSUERS_ATTR + "')");
             }
             LOG.debugv("Actor token issuer matches trust list entry; verifying against issuer JWKS");
-            verifierCtx = externalVerifier(session, iss, kid, alg);
+            // Pass the NORMALIZED issuer (the entry that was matched on the
+            // trust list), not the raw attacker-controlled token iss. The
+            // JWKS URL is built from that string, so an iss that normalizes
+            // equal to a trusted entry but contains attacker bytes would
+            // otherwise reach resolveJwksUrl verbatim. (AppSec review F2,
+            // COG-883.)
+            verifierCtx = externalVerifier(session, normalizedIss, kid, alg);
         }
 
         // Final verify pass with the resolved verifier context. This runs the
@@ -296,17 +302,34 @@ public class ActClaimTokenExchangeProvider implements TokenExchangeProvider {
      * an external (trusted) issuer. Fetches the issuer's JWKS via OIDC
      * discovery (or Keycloak's default JWKS path), selects the key whose
      * {@code kid} matches the actor_token header, and returns the verifier.
+     *
+     * <p>The JWK IS the trust anchor for the external path (constraint 1):
+     * the {@code alg} we verify with is derived from the JWK's published
+     * {@code kty}/{@code alg}, never from the actor_token's JWS header.
+     * The header {@code alg} is attacker-controlled; the JWK is the
+     * operator-controlled trust list entry. (AppSec review F1, COG-883:
+     * close the RS→HS confusion vector by pinning the alg to the JWK.)
+     *
+     * <p>{@code trustedIssuer} is the normalized issuer string that
+     * matched the trust list (i.e. operator-controlled, not attacker
+     * bytes). It is used to build the JWKS URL. (AppSec review F2,
+     * COG-883.)
      */
-    private SignatureVerifierContext externalVerifier(KeycloakSession session, String issuer,
-                                                      String kid, String alg) throws VerificationException {
+    private SignatureVerifierContext externalVerifier(KeycloakSession session, String trustedIssuer,
+                                                      String kid, String headerAlg) throws VerificationException {
         if (kid == null || kid.isEmpty()) {
             throw new VerificationException("actor_token JWS header missing 'kid' — cannot resolve external key");
         }
-        if (alg == null || alg.isEmpty()) {
+        if (headerAlg == null || headerAlg.isEmpty()) {
             throw new VerificationException("actor_token JWS header missing 'alg' — cannot resolve external key");
         }
-        String jwksUrl = resolveJwksUrl(session, issuer);
-        LOG.debugv("Fetching JWKS for trusted issuer {0} from {1}", issuer, jwksUrl);
+        if ("none".equalsIgnoreCase(headerAlg)) {
+            // The parse pass above should have caught this, but be explicit:
+            // an unsigned actor_token never reaches a verifier.
+            throw new UntrustedActorTokenException("unsigned actor_token (alg=none) is not allowed");
+        }
+        String jwksUrl = resolveJwksUrl(session, trustedIssuer);
+        LOG.debugv("Fetching JWKS for trusted issuer {0} from {1}", trustedIssuer, jwksUrl);
         JSONWebKeySet jwks;
         try {
             jwks = JWKSHttpUtils.sendJwksRequest(session, jwksUrl);
@@ -329,8 +352,13 @@ public class ActClaimTokenExchangeProvider implements TokenExchangeProvider {
             // not in that issuer's JWKS MUST be rejected. This is exactly that
             // branch: the kid is nowhere on the trust list's JWKS.
             throw new UntrustedActorTokenException(
-                    "actor_token kid '" + kid + "' not present in trusted issuer " + issuer + " JWKS");
+                    "actor_token kid '" + kid + "' not present in trusted issuer " + trustedIssuer + " JWKS");
         }
+
+        // Pin the verifier alg to the JWK. The header alg is attacker-
+        // controlled and not used to select a SignatureProvider on the
+        // external path.
+        String jwkAlg = resolveExternalAlg(matched);
 
         PublicKey publicKey;
         try {
@@ -345,16 +373,83 @@ public class ActClaimTokenExchangeProvider implements TokenExchangeProvider {
 
         KeyWrapper kw = new KeyWrapper();
         kw.setKid(kid);
-        kw.setAlgorithm(alg);
+        kw.setAlgorithm(jwkAlg);
         kw.setUse(KeyUse.SIG);
         kw.setPublicKey(publicKey);
 
-        SignatureProvider provider = session.getProvider(SignatureProvider.class, alg);
+        SignatureProvider provider = session.getProvider(SignatureProvider.class, jwkAlg);
         if (provider == null) {
-            throw new VerificationException("no SignatureProvider registered for alg=" + alg);
+            throw new VerificationException("no SignatureProvider registered for alg=" + jwkAlg);
         }
-        SignatureProvider.checkKeyForVerification(kw, alg, "verification");
+        SignatureProvider.checkKeyForVerification(kw, jwkAlg, "verification");
         return provider.verifier(kw);
+    }
+
+    /**
+     * Resolve the JWS {@code alg} to use for an external (JWKS-resolved)
+     * key. The JWK is the trust anchor; the header alg is not consulted.
+     *
+     * <p>Rejects (as {@link UntrustedActorTokenException} — 4xx, not 5xx,
+     * so the exchange fails closed with the right error class):
+     * <ul>
+     *   <li>{@code kty=oct} — a symmetric key in a JWKS is a classic
+     *       RS→HS confusion primitive.</li>
+     *   <li>{@code alg=none} — an unsigned token.</li>
+     *   <li>{@code alg} starting with {@code HS} (HS256/HS384/HS512) —
+     *       symmetric MACs are not acceptable on the external path;
+     *       constraint 1 requires an asymmetric trust anchor.</li>
+     *   <li>no {@code alg} published and no derivable default for the
+     *       JWK's {@code kty} — the JWKS is the trust contract and an
+     *       alg-less key is not verifiable against an explicit contract.</li>
+     * </ul>
+     *
+     * <p>Returns the JWK's published {@code alg} when present. For
+     * well-known {@code kty} values without an alg, returns a sensible
+     * default (RS256 for RSA, ES256 for EC, EdDSA for OKP) so a JWKS
+     * that follows the spec-recommended but not mandatory alg-on-every-
+     * key practice still verifies cleanly.
+     */
+    static String resolveExternalAlg(JWK matched) {
+        String kty = matched.getKeyType();
+        if ("oct".equalsIgnoreCase(kty)) {
+            throw new UntrustedActorTokenException(
+                    "trusted issuer JWKS key has kty=oct — symmetric keys are not accepted for actor_token verification");
+        }
+        String alg = matched.getAlgorithm();
+        if (alg != null && !alg.isEmpty()) {
+            if (isSymmetricAlg(alg)) {
+                throw new UntrustedActorTokenException(
+                        "trusted issuer JWKS key has symmetric alg '" + alg + "' — asymmetric algs are required for actor_token verification");
+            }
+            if ("none".equalsIgnoreCase(alg)) {
+                throw new UntrustedActorTokenException(
+                        "trusted issuer JWKS key has alg=none — unsigned keys are not accepted for actor_token verification");
+            }
+            return alg;
+        }
+        // No alg on the JWK — derive a default from the kty so a spec-
+        // compliant but alg-less JWKS still works. If the kty is not one
+        // we recognize, refuse rather than guess.
+        if ("RSA".equalsIgnoreCase(kty)) {
+            return "RS256";
+        }
+        if ("EC".equalsIgnoreCase(kty)) {
+            return "ES256";
+        }
+        if ("OKP".equalsIgnoreCase(kty)) {
+            return "EdDSA";
+        }
+        throw new UntrustedActorTokenException(
+                "trusted issuer JWKS key has no alg and unknown kty '" + kty + "' — cannot pin verification alg");
+    }
+
+    private static boolean isSymmetricAlg(String alg) {
+        // RFC 7518 §3.2 — JWA symmetric algorithms are HS256, HS384, HS512.
+        // Covering the lowercase form too for paranoia.
+        return alg.length() >= 3
+                && (alg.charAt(0) == 'H' || alg.charAt(0) == 'h')
+                && (alg.charAt(1) == 'S' || alg.charAt(1) == 's')
+                && Character.isDigit(alg.charAt(2));
     }
 
     /**

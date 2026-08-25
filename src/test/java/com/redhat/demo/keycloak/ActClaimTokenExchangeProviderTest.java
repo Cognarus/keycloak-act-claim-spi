@@ -5,6 +5,7 @@ import java.util.List;
 import java.util.Map;
 
 import org.junit.jupiter.api.Test;
+import org.keycloak.jose.jwk.JWK;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -171,5 +172,116 @@ class ActClaimTokenExchangeProviderTest {
                         "actor_token issuer 'https://evil/' is not on the configured trust list");
         assertTrue(e.getMessage().contains("evil"));
         assertTrue(e.getMessage().contains("trust list"));
+    }
+
+    // ---- AppSec review F1 (COG-883): alg pinning on the external path ----
+    //
+    // The JWK IS the trust anchor for external issuer verification. The
+    // header alg is attacker-controlled and must not select a
+    // SignatureProvider. These tests cover the resolveExternalAlg helper —
+    // the seam that pins the verifier alg to the JWK and rejects the
+    // RS→HS confusion primitive before any signature math runs.
+
+    private static JWK jwk(String kty, String alg, String kid) {
+        JWK k = new JWK();
+        k.setKeyType(kty);
+        if (alg != null) k.setAlgorithm(alg);
+        if (kid != null) k.setKeyId(kid);
+        return k;
+    }
+
+    @Test
+    void testResolveExternalAlgPublishedAlgWins() {
+        // JWK publishes its alg — use it directly, ignore any header alg.
+        assertEquals("RS256", ActClaimTokenExchangeProvider.resolveExternalAlg(
+                jwk("RSA", "RS256", "k1")));
+        assertEquals("RS384", ActClaimTokenExchangeProvider.resolveExternalAlg(
+                jwk("RSA", "RS384", "k2")));
+        assertEquals("ES256", ActClaimTokenExchangeProvider.resolveExternalAlg(
+                jwk("EC", "ES256", "k3")));
+        assertEquals("PS256", ActClaimTokenExchangeProvider.resolveExternalAlg(
+                jwk("RSA", "PS256", "k4")));
+    }
+
+    @Test
+    void testResolveExternalAlgKtyOctRejected() {
+        // kty=oct is a symmetric key in a JWKS — the classic RS→HS
+        // confusion primitive. Reject with UntrustedActorTokenException
+        // (which becomes 4xx in exchange()), not 5xx.
+        ActClaimTokenExchangeProvider.UntrustedActorTokenException e =
+                assertThrows(ActClaimTokenExchangeProvider.UntrustedActorTokenException.class,
+                        () -> ActClaimTokenExchangeProvider.resolveExternalAlg(
+                                jwk("oct", "HS256", "evil")));
+        assertTrue(e.getMessage().toLowerCase().contains("oct"),
+                "exception message must mention the offending kty: " + e.getMessage());
+    }
+
+    @Test
+    void testResolveExternalAlgSymmetricAlgRejected() {
+        // alg=HS256/HS384/HS512 must be rejected even if the JWK is
+        // otherwise well-formed. An attacker who somehow gets a JWK
+        // entry with a symmetric alg published must not be able to
+        // verify tokens against it.
+        for (String hs : List.of("HS256", "HS384", "HS512", "hs256", "hs512")) {
+            ActClaimTokenExchangeProvider.UntrustedActorTokenException e =
+                    assertThrows(ActClaimTokenExchangeProvider.UntrustedActorTokenException.class,
+                            () -> ActClaimTokenExchangeProvider.resolveExternalAlg(
+                                    jwk("RSA", hs, "k1")),
+                            "expected rejection for alg=" + hs);
+            assertTrue(e.getMessage().toLowerCase().contains("symmetric"),
+                    "exception message must mention symmetric for alg=" + hs + ": " + e.getMessage());
+        }
+    }
+
+    @Test
+    void testResolveExternalAlgNoneRejected() {
+        // alg=none on the JWK is not a usable verification key.
+        ActClaimTokenExchangeProvider.UntrustedActorTokenException e =
+                assertThrows(ActClaimTokenExchangeProvider.UntrustedActorTokenException.class,
+                        () -> ActClaimTokenExchangeProvider.resolveExternalAlg(
+                                jwk("RSA", "none", "k1")));
+        assertTrue(e.getMessage().toLowerCase().contains("none"),
+                "exception message must mention none: " + e.getMessage());
+    }
+
+    @Test
+    void testResolveExternalAlgDerivesFromKtyWhenAlgMissing() {
+        // Spec-recommended but not mandatory: a JWKS may publish a JWK
+        // without an alg. We accept it and derive a sensible default
+        // from the kty, so a correctly-formatted JWKS still verifies.
+        assertEquals("RS256", ActClaimTokenExchangeProvider.resolveExternalAlg(
+                jwk("RSA", null, "k1")));
+        assertEquals("ES256", ActClaimTokenExchangeProvider.resolveExternalAlg(
+                jwk("EC", null, "k2")));
+        assertEquals("EdDSA", ActClaimTokenExchangeProvider.resolveExternalAlg(
+                jwk("OKP", null, "k3")));
+    }
+
+    @Test
+    void testResolveExternalAlgUnknownKtyWithoutAlgRejected() {
+        // No alg, and a kty we don't have a default for. Refuse rather
+        // than guess — the JWKS is the trust contract.
+        ActClaimTokenExchangeProvider.UntrustedActorTokenException e =
+                assertThrows(ActClaimTokenExchangeProvider.UntrustedActorTokenException.class,
+                        () -> ActClaimTokenExchangeProvider.resolveExternalAlg(
+                                jwk("XYZ", null, "k1")));
+        assertTrue(e.getMessage().contains("XYZ"),
+                "exception message must name the offending kty: " + e.getMessage());
+    }
+
+    @Test
+    void testResolveExternalAlgRsaWithHsAlgHeaderIgnored() {
+        // The actual AppSec F1 hypothesis (COG-883): an attacker mints
+        // a token with alg=HS256 and kid=<the issuer's RSA kid>, hoping
+        // the verifier selects a Mac provider with the public key as
+        // the secret. The fix pins the verifier alg to the JWK
+        // (RS256), not the header. resolveExternalAlg has no access to
+        // the header by design — the header never reaches it. This test
+        // documents the contract.
+        JWK rsa = jwk("RSA", "RS256", "victim-kid");
+        // The helper's only input is the JWK. If a future refactor adds
+        // the header alg as a parameter, this test will need to assert
+        // that it is *ignored* — pin to the JWK.
+        assertEquals("RS256", ActClaimTokenExchangeProvider.resolveExternalAlg(rsa));
     }
 }

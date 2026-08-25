@@ -8,3 +8,6 @@ target/
 # Local credentials (use env.sh.example as template)
 scripts/env.sh
 .DS_Store
+
+# OpenCode local settings (per-machine, never commit)
+.claude/

@@ -293,7 +293,13 @@ public class ActClaimTokenExchangeProvider implements TokenExchangeProvider {
         if (provider == null) {
             throw new VerificationException("no SignatureProvider registered for alg=" + alg);
         }
-        SignatureProvider.checkKeyForVerification(key, alg, "verification");
+        // COG-889 — the third arg to checkKeyForVerification is the KEY TYPE
+        // (RSA / EC / OCT / OKP), not an operation label. The realm signing
+        // key loaded via session.keys() already has its type set ("RSA" for
+        // the default RSA-2048 realm key); pass that back so the type
+        // check matches. Passing a literal like "verification" makes the
+        // check always fail (COG-883 regression caught by the live gate).
+        SignatureProvider.checkKeyForVerification(key, alg, key.getType());
         return provider.verifier(key);
     }
 
@@ -375,13 +381,20 @@ public class ActClaimTokenExchangeProvider implements TokenExchangeProvider {
         kw.setKid(kid);
         kw.setAlgorithm(jwkAlg);
         kw.setUse(KeyUse.SIG);
+        kw.setType(resolveExternalKeyType(matched));
         kw.setPublicKey(publicKey);
 
         SignatureProvider provider = session.getProvider(SignatureProvider.class, jwkAlg);
         if (provider == null) {
             throw new VerificationException("no SignatureProvider registered for alg=" + jwkAlg);
         }
-        SignatureProvider.checkKeyForVerification(kw, jwkAlg, "verification");
+        // COG-889 — the third arg to checkKeyForVerification is the KEY TYPE
+        // (RSA / EC / OKP), not an operation label. resolveExternalKeyType
+        // picks the right KeyType value from the JWK's kty; we pass it back
+        // from kw.getType() so the type check matches. Passing a literal
+        // like "verification" makes the check always fail (COG-883
+        // regression caught by the live gate).
+        SignatureProvider.checkKeyForVerification(kw, jwkAlg, kw.getType());
         return provider.verifier(kw);
     }
 
@@ -450,6 +463,48 @@ public class ActClaimTokenExchangeProvider implements TokenExchangeProvider {
                 && (alg.charAt(0) == 'H' || alg.charAt(0) == 'h')
                 && (alg.charAt(1) == 'S' || alg.charAt(1) == 's')
                 && Character.isDigit(alg.charAt(2));
+    }
+
+    /**
+     * Resolve the key type (for
+     * {@link SignatureProvider#checkKeyForVerification(org.keycloak.crypto.KeyWrapper, String, String)})
+     * to use for an external (JWKS-resolved) key. Mirrors
+     * {@link #resolveExternalAlg(JWK)} but returns the {@code kty} value
+     * that Keycloak's {@code KeyType} enum accepts ({@code "RSA"} /
+     * {@code "EC"} / {@code "OKP"}).
+     *
+     * <p>By the time this is called, {@link #resolveExternalAlg(JWK)} has
+     * already rejected {@code kty=oct} and any unknown kty — the JWK is
+     * the trust anchor and a symmetric or unrecognized key type must not
+     * reach a signature provider. This helper still defends against
+     * unexpected values so a direct caller (or future refactor that calls
+     * it without {@code resolveExternalAlg} first) produces a clear
+     * 4xx-class error here, not a confusing {@code VerificationException}
+     * from inside KC's signature provider.
+     *
+     * <p><b>COG-889 root cause.</b> The third argument to
+     * {@code checkKeyForVerification} is the KEY TYPE, not an operation
+     * label. The previous version of this method passed the literal
+     * string {@code "verification"} at the call site, which made the
+     * type-equality check {@code "verification".equals("RSA")} always
+     * false and rejected every legitimate actor_token. Passing
+     * {@code kw.getType()} — populated here from the JWK's {@code kty} —
+     * is what makes the external path verify.
+     */
+    static String resolveExternalKeyType(JWK matched) throws VerificationException {
+        String kty = matched.getKeyType();
+        if (kty == null || kty.isEmpty()) {
+            throw new VerificationException(
+                    "trusted issuer JWKS key has no kty — cannot resolve key type for actor_token verification");
+        }
+        if ("RSA".equalsIgnoreCase(kty)) return "RSA";
+        if ("EC".equalsIgnoreCase(kty)) return "EC";
+        if ("OKP".equalsIgnoreCase(kty)) return "OKP";
+        // resolveExternalAlg already rejected "oct" — defensive here so
+        // a future caller without that gate gets the same 4xx-class
+        // error message rather than a 5xx from KC's provider.
+        throw new UntrustedActorTokenException(
+                "trusted issuer JWKS key has unsupported kty '" + kty + "' for actor_token verification");
     }
 
     /**

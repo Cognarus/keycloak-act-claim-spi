@@ -284,4 +284,118 @@ class ActClaimTokenExchangeProviderTest {
         // that it is *ignored* — pin to the JWK.
         assertEquals("RS256", ActClaimTokenExchangeProvider.resolveExternalAlg(rsa));
     }
+
+    // ---- COG-889 regression coverage: resolveExternalKeyType -------------
+    //
+    // The COG-883 patch called
+    //     SignatureProvider.checkKeyForVerification(kw, jwkAlg, "verification")
+    // with the literal string "verification" in the third slot. KC's
+    // SignatureProvider treats that slot as the KEY TYPE (RSA / EC / OKP),
+    // not an operation label, so the check always failed and every
+    // legitimate actor_token was rejected (OBLIGATION 2 REFUTED on the
+    // COG-888 live gate). The fix calls resolveExternalKeyType(matched)
+    // to map the JWK's kty → the matching KeyType string and sets
+    // kw.setType(...) before the check; checkKeyForVerification then
+    // sees kw.getType() on both sides of the equality and the verify
+    // can proceed.
+    //
+    // The COG-888 harness (run_proofs.py) is the end-to-end proof that
+    // the call site uses this helper correctly. These unit tests pin
+    // the helper's contract so a future regression that returns the
+    // wrong string here surfaces in mvn test, not only in a live gate.
+
+    @Test
+    void testResolveExternalKeyTypeRsa() throws org.keycloak.common.VerificationException {
+        // The default KC realm signing key, and the most common external
+        // trust-list entry. The helper must return the literal "RSA" so
+        // it matches Keycloak's KeyType.RSA.name().
+        assertEquals("RSA", ActClaimTokenExchangeProvider.resolveExternalKeyType(
+                jwk("RSA", "RS256", "k1")));
+    }
+
+    @Test
+    void testResolveExternalKeyTypeEc() throws org.keycloak.common.VerificationException {
+        // An EC JWKS entry. ES256 (or any EC alg) pairs with KeyType.EC.
+        assertEquals("EC", ActClaimTokenExchangeProvider.resolveExternalKeyType(
+                jwk("EC", "ES256", "k1")));
+    }
+
+    @Test
+    void testResolveExternalKeyTypeOkp() throws org.keycloak.common.VerificationException {
+        // OKP / EdDSA. Used for some federation IdPs (e.g. newer Auth0
+        // / WorkOS issuers). The third slot must be "OKP" so KC's
+        // signature provider matches the JWK.
+        assertEquals("OKP", ActClaimTokenExchangeProvider.resolveExternalKeyType(
+                jwk("OKP", "EdDSA", "k1")));
+    }
+
+    @Test
+    void testResolveExternalKeyTypeOctRejected() {
+        // kty=oct is a symmetric key in a JWKS — the classic RS→HS
+        // confusion primitive. resolveExternalAlg already rejects this
+        // at the alg gate, but resolveExternalKeyType must also reject
+        // it (defensive: a direct caller without the alg gate should
+        // get the same 4xx-class error message here, not a confusing
+        // 5xx from KC's provider).
+        ActClaimTokenExchangeProvider.UntrustedActorTokenException e =
+                assertThrows(ActClaimTokenExchangeProvider.UntrustedActorTokenException.class,
+                        () -> ActClaimTokenExchangeProvider.resolveExternalKeyType(
+                                jwk("oct", "HS256", "k1")));
+        assertTrue(e.getMessage().toLowerCase().contains("oct"),
+                "exception message must mention the offending kty: " + e.getMessage());
+    }
+
+    @Test
+    void testResolveExternalKeyTypeUnknownKtyRejected() {
+        // Unknown kty (e.g., legacy or vendor-specific). Reject — the
+        // SPI must not guess at a KeyType value KC does not accept.
+        ActClaimTokenExchangeProvider.UntrustedActorTokenException e =
+                assertThrows(ActClaimTokenExchangeProvider.UntrustedActorTokenException.class,
+                        () -> ActClaimTokenExchangeProvider.resolveExternalKeyType(
+                                jwk("XYZ", "RS256", "k1")));
+        assertTrue(e.getMessage().contains("XYZ"),
+                "exception message must name the offending kty: " + e.getMessage());
+    }
+
+    @Test
+    void testResolveExternalKeyTypeNullKtyRejected() {
+        // A JWK with no kty at all is malformed. Defensive — a direct
+        // caller should get VerificationException, not a NullPointerException
+        // inside the helper.
+        JWK noKty = new JWK();
+        noKty.setKeyId("k1");
+        // No setKeyType — leaves kty null.
+        assertThrows(org.keycloak.common.VerificationException.class,
+                () -> ActClaimTokenExchangeProvider.resolveExternalKeyType(noKty));
+    }
+
+    @Test
+    void testResolveExternalKeyTypeRejectsTheLiteralVerification() throws org.keycloak.common.VerificationException {
+        // Pin the COG-889 root-cause contract: resolveExternalKeyType
+        // must NEVER return "verification" (or any other non-KC-KeyType
+        // literal). If a future regression returns the literal here,
+        // SignatureProvider.checkKeyForVerification will compare it
+        // against kw.getType() ("RSA") and reject every actor_token —
+        // exactly the OBLIGATION-2 failure this fix closes.
+        //
+        // We assert this by feeding JWKs of the supported kty values
+        // and checking none of them round-trips to "verification".
+        String rsa = ActClaimTokenExchangeProvider.resolveExternalKeyType(
+                jwk("RSA", "RS256", "k1"));
+        String ec = ActClaimTokenExchangeProvider.resolveExternalKeyType(
+                jwk("EC", "ES256", "k2"));
+        String okp = ActClaimTokenExchangeProvider.resolveExternalKeyType(
+                jwk("OKP", "EdDSA", "k3"));
+        assertNotEquals("verification", rsa,
+                "COG-889 regression: resolveExternalKeyType must NOT return \"verification\" for RSA");
+        assertNotEquals("verification", ec,
+                "COG-889 regression: resolveExternalKeyType must NOT return \"verification\" for EC");
+        assertNotEquals("verification", okp,
+                "COG-889 regression: resolveExternalKeyType must NOT return \"verification\" for OKP");
+        // And they must be the exact KC KeyType.name() values, so the
+        // equality check inside checkKeyForVerification passes.
+        assertEquals("RSA", rsa);
+        assertEquals("EC", ec);
+        assertEquals("OKP", okp);
+    }
 }
